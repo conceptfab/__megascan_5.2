@@ -11,8 +11,8 @@
 #
 # ##### QUIXEL AB - MEGASCANS PLUGIN FOR BLENDER #####
 
-import bpy, threading, os, time, json, socket
-from bpy.app.handlers import persistent
+import bpy, os, time, json, socket, logging
+from collections import deque
 
 globals()['Megascans_DataSet'] = None
 
@@ -31,11 +31,276 @@ globals()['MG_Material'] = []
 globals()['MG_AlembicPath'] = []
 globals()['MG_ImportComplete'] = False
 
+# ---------------------------------------------------------------------------
+# LiveLink runtime state — single source of truth for the UI panel.
+# The transport is threadless: a non-blocking socket serviced from a
+# bpy.app.timers pump on the main thread (nothing that can die silently).
+# ---------------------------------------------------------------------------
+
+STATUS_STOPPED = 'STOPPED'
+STATUS_LISTENING = 'LISTENING'
+STATUS_PORT_BUSY = 'PORT_BUSY'
+STATUS_RELEASED = 'RELEASED'   # port was claimed by another instance
+
+DEFAULT_PORT = 28888
+PUMP_INTERVAL = 0.2
+BIND_RETRY_INTERVAL = 2.0
+MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
+
+class _LiveLinkState:
+    def __init__(self):
+        self.status = STATUS_STOPPED
+        self.port = DEFAULT_PORT
+        self.last_asset = ""
+        self.last_asset_time = ""
+        self.last_error = ""
+        self.events = deque(maxlen=50)
+        self.server = None        # listening socket, or None
+        self.connections = []     # [socket, bytearray] pairs being received
+        self.queue = deque()      # complete raw payloads waiting for import
+        self.claimed_away = False # True after another instance claimed the port
+        self.last_bind_retry = 0.0
+
+STATE = _LiveLinkState()
+_LOGGER = None
+
+def _log_dir():
+    return bpy.utils.user_resource('CONFIG', path="MSPlugin_logs", create=True)
+
+def _get_logger():
+    # Per-process log file (PID suffix): two Blender instances logging
+    # concurrently on Windows is a first-class supported scenario.
+    global _LOGGER
+    if _LOGGER is None:
+        logger = logging.getLogger("MSPlugin")
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        if not logger.handlers:
+            try:
+                path = os.path.join(_log_dir(), "msplugin_%d.log" % os.getpid())
+                handler = logging.FileHandler(path, encoding="utf-8")
+                handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+                logger.addHandler(handler)
+            except Exception:
+                pass
+        _LOGGER = logger
+    return _LOGGER
+
+def log_event(level, message):
+    STATE.events.append("%s [%s] %s" % (time.strftime("%H:%M:%S"), level, message))
+    if level in ("ERROR", "WARNING"):
+        STATE.last_error = message
+    try:
+        py_level = {"ERROR": logging.ERROR, "WARNING": logging.WARNING}.get(level, logging.INFO)
+        _get_logger().log(py_level, message)
+    except Exception:
+        pass
+    print("MSPlugin [%s] %s" % (level, message))
+    _redraw_panels()
+
+def _redraw_panels():
+    if bpy.app.background:
+        return
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+def _notify_error(message):
+    # Loud-failure policy: popup on total failure, at most one per payload.
+    if bpy.app.background:
+        return
+    def draw(menu, context):
+        menu.layout.label(text=message)
+    try:
+        bpy.context.window_manager.popup_menu(draw, title="Megascans Plugin", icon='ERROR')
+    except Exception:
+        pass
+
+def _get_port():
+    try:
+        return bpy.context.preferences.addons[__name__].preferences.port
+    except Exception:
+        return DEFAULT_PORT
+
+# --------------------------- transport ------------------------------------
+
+def start_listener(quiet=False):
+    if STATE.server is not None:
+        return True
+    port = _get_port()
+    STATE.port = port
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        # Deliberately no SO_REUSEADDR: on Windows it would let two instances
+        # bind the same port and break conflict detection.
+        sock.bind(('localhost', port))
+        sock.listen(5)
+        sock.setblocking(False)
+        STATE.server = sock
+        STATE.status = STATUS_LISTENING
+        STATE.claimed_away = False
+        log_event("INFO", "LiveLink listening on port %d" % port)
+        return True
+    except OSError as e:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        in_use = getattr(e, 'winerror', None) == 10048 or getattr(e, 'errno', None) in (48, 98, 10048)
+        if in_use:
+            if STATE.status != STATUS_PORT_BUSY:
+                STATE.status = STATUS_PORT_BUSY
+                if not quiet:
+                    log_event("WARNING", "Port %d is busy — is another Blender instance running? Imports go to the instance that owns the port." % port)
+        else:
+            STATE.status = STATUS_STOPPED
+            if not quiet:
+                log_event("ERROR", "LiveLink failed to start: %s" % e)
+        return False
+
+def stop_listener(reason=""):
+    for entry in STATE.connections:
+        try:
+            entry[0].close()
+        except OSError:
+            pass
+    STATE.connections = []
+    if STATE.server is not None:
+        try:
+            STATE.server.close()
+        except OSError:
+            pass
+        STATE.server = None
+    if STATE.status != STATUS_RELEASED:
+        STATE.status = STATUS_STOPPED
+    if reason:
+        log_event("INFO", reason)
+
+def _service_sockets():
+    if STATE.server is None:
+        return
+    # Accept eagerly every tick — Bridge must never see a refused connection
+    # just because an import is queued.
+    while True:
+        try:
+            client, _addr = STATE.server.accept()
+            client.setblocking(False)
+            STATE.connections.append([client, bytearray()])
+        except (BlockingIOError, InterruptedError):
+            break
+        except OSError:
+            break
+    finished = []
+    for entry in STATE.connections:
+        sock, buf = entry
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    finished.append(entry)  # peer closed -> payload complete
+                    break
+                buf += chunk
+                if len(buf) > MAX_PAYLOAD_BYTES:
+                    log_event("ERROR", "Incoming payload exceeded %d MB — dropped." % (MAX_PAYLOAD_BYTES // (1024 * 1024)))
+                    buf.clear()
+                    finished.append(entry)
+                    break
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError:
+            finished.append(entry)
+    for entry in finished:
+        sock, buf = entry
+        try:
+            sock.close()
+        except OSError:
+            pass
+        if entry in STATE.connections:
+            STATE.connections.remove(entry)
+        data = bytes(buf)
+        if not data:
+            continue
+        if data == b'Bye Megascans':
+            # Another instance claimed the port. Release it VISIBLY and do not
+            # auto-rebind (no claim ping-pong) — user can press Reclaim.
+            stop_listener()
+            STATE.status = STATUS_RELEASED
+            STATE.claimed_away = True
+            log_event("WARNING", "LiveLink released — claimed by another instance.")
+            continue
+        STATE.queue.append(data)
+        log_event("INFO", "Payload received (%d bytes), %d in queue." % (len(data), len(STATE.queue)))
+
+def _maybe_retry_bind():
+    # Live port-preference change: rebind on the new port.
+    if STATE.server is not None and STATE.port != _get_port():
+        stop_listener("Port preference changed — rebinding.")
+        start_listener()
+        return
+    # Startup conflict self-heal: passively retry while Port-busy. Never after
+    # being claimed (STATUS_RELEASED) — that would steal the port back.
+    if STATE.server is None and STATE.status == STATUS_PORT_BUSY and not STATE.claimed_away:
+        now = time.time()
+        if now - STATE.last_bind_retry >= BIND_RETRY_INTERVAL:
+            STATE.last_bind_retry = now
+            start_listener(quiet=True)
+
+def _import_payload(data):
+    try:
+        assets = json.loads(data)
+    except (ValueError, UnicodeDecodeError) as e:
+        log_event("ERROR", "Received payload is not valid Bridge JSON: %s" % e)
+        _notify_error("Megascans: received invalid data — see Megascans panel")
+        return
+    if not isinstance(assets, list):
+        assets = [assets]
+    ok, failed = [], []
+    for asset in assets:
+        name = asset.get("name", asset.get("id", "?")) if isinstance(asset, dict) else "?"
+        try:
+            globals()['Megascans_DataSet'] = json.dumps([asset])
+            importer = MS_Init_ImportProcess()
+            if importer.import_error:
+                failed.append((name, importer.import_error))
+            else:
+                ok.append(name)
+        except Exception as e:
+            failed.append((name, str(e)))
+            log_event("ERROR", "Failed to import %s: %s" % (name, e))
+    # Aggregate per payload: one summary, never one popup per asset.
+    if failed and not ok:
+        msg = "Megascans: all %d asset(s) failed to import — see Megascans panel" % len(failed)
+        log_event("ERROR", msg)
+        _notify_error(msg)
+    elif failed:
+        log_event("WARNING", "Megascans: imported %d, failed %d — see log for details." % (len(ok), len(failed)))
+    elif ok:
+        log_event("INFO", "Megascans: imported %d asset(s)." % len(ok))
+    if ok:
+        STATE.last_asset = ok[-1]
+        STATE.last_asset_time = time.strftime("%H:%M:%S")
+        if not failed:
+            STATE.last_error = ""  # error display clears on next clean import
+
+def _pump():
+    try:
+        _service_sockets()
+        if STATE.queue:
+            _import_payload(STATE.queue.popleft())
+        _maybe_retry_bind()
+    except Exception as e:
+        log_event("ERROR", "LiveLink pump error: %s" % e)
+    return PUMP_INTERVAL
+
 bl_info = {
     "name": "Megascans Plugin",
     "description": "Connects Blender to Quixel Bridge for one-click imports with shader setup and geometry. Updated for Blender 4.x/5.2.",
     "author": "CONCEPTFAB (original: Quixel)",
-    "version": (3, 8, 0),
+    "version": (3, 9, 0),
     "blender": (4, 0, 0),
     "location": "File > Import",
     "warning": "", # used for warning icon and text in addons panel
@@ -55,7 +320,7 @@ class MS_Init_ImportProcess():
     # later on in the initImportProcess method. The method loops on all assets
     # that have been sent by Bridge.
     def __init__(self):
-        print("Initialized import class...")
+        self.import_error = None
         try:
             # Check if there's any incoming data
             if globals()['Megascans_DataSet'] != None:
@@ -162,13 +427,15 @@ class MS_Init_ImportProcess():
 
                     # Initialize the import method to start building our shader and import our geometry
                     self.initImportProcess()
-                    print("Imported asset from " + self.assetName + " Quixel Bridge")
-        
+                    if not self.import_error:
+                        log_event("INFO", "Imported asset %s from Quixel Bridge" % self.assetName)
+
             if len(globals()['MG_AlembicPath']) > 0:
-                globals()['MG_ImportComplete'] = True        
+                globals()['MG_ImportComplete'] = True
         except Exception as e:
-            print( "Megascans Plugin Error initializing the import process. Error: ", str(e) )
-        
+            self.import_error = str(e)
+            log_event("ERROR", "Import process failed: %s" % e)
+
         globals()['Megascans_DataSet'] = None
     
     # this method is used to import the geometry and create the material setup.
@@ -193,7 +460,8 @@ class MS_Init_ImportProcess():
                     globals()['MG_Material'].append(self.mat)
 
         except Exception as e:
-            print( "Megascans Plugin Error while importing textures/geometry or setting up material. Error: ", str(e) )
+            self.import_error = str(e)
+            log_event("ERROR", "Error importing %s (textures/geometry/material): %s" % (getattr(self, 'assetName', '?'), e))
 
     def ImportGeometry(self):
         try:
@@ -229,7 +497,8 @@ class MS_Init_ImportProcess():
             if self.isAlembic:
                 globals()['MG_AlembicPath'].append(abcPaths)
         except Exception as e:
-            print( "Megascans Plugin Error while importing textures/geometry or setting up material. Error: ", str(e) )
+            self.import_error = str(e)
+            log_event("ERROR", "Error importing geometry for %s: %s" % (getattr(self, 'assetName', '?'), e))
 
     def dump(self, obj):
         for attr in dir(obj):
@@ -366,6 +635,8 @@ class MS_Init_ImportProcess():
 
     def CreateTextureNode(self, textureType, PosX, PosY, colorspace = 1, connectToMaterial = False, materialInputIndex = ""):
         texturePath = self.GetTexturePath(textureType)
+        if not texturePath or not os.path.exists(texturePath):
+            raise RuntimeError("Texture file not found: %s (%s)" % (texturePath, textureType))
         textureNode = self.CreateGenericNode('ShaderNodeTexImage', PosX, PosY)
         textureNode.image = bpy.data.images.load(texturePath)
         textureNode.show_texture = True
@@ -490,131 +761,136 @@ class MS_Init_ImportProcess():
             if item[1] == textureType:
                 return item[0].lower()
 
-class ms_Init(threading.Thread):
-    
-	#Initialize the thread and assign the method (i.e. importer) to be called when it receives JSON data.
-    def __init__(self, importer):
-        threading.Thread.__init__(self)
-        self.importer = importer
+class MSPluginPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
 
-	#Start the thread to start listing to the port.
-    def run(self):
-        try:
-            run_livelink = True
-            host, port = 'localhost', 28888
-            #Making a socket object.
-            socket_ = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            #Binding the socket to host and port number mentioned at the start.
-            socket_.bind((host, port))
+    port: bpy.props.IntProperty(
+        name="LiveLink Port",
+        description="TCP port Quixel Bridge sends to (must match Bridge's export settings)",
+        default=DEFAULT_PORT, min=1024, max=65535)
 
-            #Run until the thread starts receiving data.
-            while run_livelink:
-                socket_.listen(5)
-                #Accept connection request.
-                client, addr = socket_.accept()
-                data = ""
-                buffer_size = 4096*2
-                #Receive data from the client. 
-                data = client.recv(buffer_size)
-                if data == b'Bye Megascans':
-                    run_livelink = False
-                    break
+    def draw(self, context):
+        self.layout.prop(self, "port")
 
-                #If any data is received over the port.
-                if data != "":
-                    self.TotalData = b""
-                    self.TotalData += data #Append the previously received data to the Total Data.
-                    #Keep running until the connection is open and we are receiving data.
-                    while run_livelink:
-                        #Keep receiving data from client.
-                        data = client.recv(4096*2)
-                        if data == b'Bye Megascans':
-                            run_livelink = False
-                            break
-                        #if we are getting data keep appending it to the Total data.
-                        if data : self.TotalData += data
-                        else:
-                            #Once the data transmission is over call the importer method and send the collected TotalData.
-                            self.importer(self.TotalData)
-                            break
-        except Exception as e:
-            print( "Megascans Plugin Error initializing the thread. Error: ", str(e) )
-
-class thread_checker(threading.Thread):
-    
-	#Initialize the thread and assign the method (i.e. importer) to be called when it receives JSON data.
-    def __init__(self):
-        threading.Thread.__init__(self)
-
-	#Start the thread to start listing to the port.
-    def run(self):
-        try:
-            run_checker = True
-            while run_checker:
-                time.sleep(3)
-                for i in threading.enumerate():
-                    if(i.getName() == "MainThread" and i.is_alive() == False):
-                        host, port = 'localhost', 28888
-                        s = socket.socket()
-                        s.connect((host,port))
-                        data = "Bye Megascans"
-                        s.send(data.encode())
-                        s.close()
-                        run_checker = False
-                        break
-        except Exception as e:
-            print( "Megascans Plugin Error initializing thread checker. Error: ", str(e) )
-            pass
 
 class MS_Init_LiveLink(bpy.types.Operator):
-
+    # Legacy entry point (kept for compatibility) - ensures the livelink runs.
     bl_idname = "bridge.plugin"
     bl_label = "Megascans Plugin"
-    socketCount = 0
 
     def execute(self, context):
+        STATE.claimed_away = False
+        start_listener()
+        _ensure_pump()
+        return {'FINISHED'}
 
-        try:
-            globals()['Megascans_DataSet'] = None
-            self.thread_ = threading.Thread(target = self.socketMonitor)
-            self.thread_.start()
-            bpy.app.timers.register(self.newDataMonitor)
+
+class MS_OT_StartLiveLink(bpy.types.Operator):
+    bl_idname = "megascans.start_livelink"
+    bl_label = "Start LiveLink"
+    bl_description = "Start listening for Quixel Bridge exports"
+
+    def execute(self, context):
+        STATE.claimed_away = False
+        _ensure_pump()
+        if start_listener():
+            self.report({'INFO'}, "LiveLink listening on port %d" % STATE.port)
             return {'FINISHED'}
-        except Exception as e:
-            print( "Megascans Plugin Error starting blender plugin. Error: ", str(e) )
-            return {"FAILED"}
+        self.report({'WARNING'}, "Could not start LiveLink - see Megascans panel")
+        return {'CANCELLED'}
 
-    def newDataMonitor(self):
+
+class MS_OT_ClaimLiveLink(bpy.types.Operator):
+    bl_idname = "megascans.claim_livelink"
+    bl_label = "Claim LiveLink"
+    bl_description = "Ask the instance that owns the port to release it, then take over"
+
+    def execute(self, context):
+        port = _get_port()
+        stop_listener()
+        STATE.claimed_away = False
         try:
-            if globals()['Megascans_DataSet'] != None:
-                MS_Init_ImportProcess()
-                globals()['Megascans_DataSet'] = None       
-        except Exception as e:
-            print( "Megascans Plugin Error starting blender plugin (newDataMonitor). Error: ", str(e) )
-            return {"FAILED"}
-        return 1.0
+            peer = socket.create_connection(('localhost', port), timeout=1.0)
+            peer.sendall(b'Bye Megascans')
+            peer.close()
+        except OSError as e:
+            self.report({'ERROR'}, "Could not reach the port %d owner: %s" % (port, e))
+            STATE.status = STATUS_PORT_BUSY
+            return {'CANCELLED'}
+        for _ in range(15):  # wait up to ~3 s for the owner to release
+            time.sleep(0.2)
+            if start_listener(quiet=True):
+                log_event("INFO", "LiveLink claimed - listening on port %d." % port)
+                self.report({'INFO'}, "LiveLink claimed (port %d)" % port)
+                return {'FINISHED'}
+        STATE.status = STATUS_PORT_BUSY
+        msg = "Port %d owner did not release the port (a foreign process, or a modified plugin?)" % port
+        log_event("ERROR", msg)
+        self.report({'ERROR'}, msg)
+        return {'CANCELLED'}
 
 
-    def socketMonitor(self):
+class MS_OT_CopyLog(bpy.types.Operator):
+    bl_idname = "megascans.copy_log"
+    bl_label = "Copy Log"
+    bl_description = "Copy the recent event log to the clipboard"
+
+    def execute(self, context):
+        context.window_manager.clipboard = "\n".join(STATE.events)
+        self.report({'INFO'}, "Megascans log copied to clipboard")
+        return {'FINISHED'}
+
+
+class MS_OT_OpenLogFolder(bpy.types.Operator):
+    bl_idname = "megascans.open_log_folder"
+    bl_label = "Open Log Folder"
+    bl_description = "Open the folder containing the persistent MSPlugin log files"
+
+    def execute(self, context):
         try:
-            #Making a thread object
-            threadedServer = ms_Init(self.importer)
-            #Start the newly created thread.
-            threadedServer.start()
-            #Making a thread object
-            thread_checker_ = thread_checker()
-            #Start the newly created thread.
-            thread_checker_.start()
+            bpy.ops.wm.path_open(filepath=_log_dir())
         except Exception as e:
-            print( "Megascans Plugin Error starting blender plugin (socketMonitor). Error: ", str(e) )
-            return {"FAILED"}
+            self.report({'ERROR'}, "Could not open log folder: %s" % e)
+            return {'CANCELLED'}
+        return {'FINISHED'}
 
-    def importer (self, recv_data):
-        try:
-            globals()['Megascans_DataSet'] = recv_data
-        except Exception as e:
-            print( "Megascans Plugin Error starting blender plugin (importer). Error: ", str(e) )
-            return {"FAILED"}
+
+class MS_PT_LiveLink(bpy.types.Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Megascans"
+    bl_label = "Megascans LiveLink"
+
+    def draw(self, context):
+        layout = self.layout
+        if STATE.status == STATUS_LISTENING:
+            layout.label(text="Listening on port %d" % STATE.port, icon='CHECKMARK')
+        elif STATE.status == STATUS_PORT_BUSY:
+            layout.label(text="Port %d busy - another instance?" % STATE.port, icon='ERROR')
+            layout.operator(MS_OT_ClaimLiveLink.bl_idname, icon='FILE_REFRESH')
+        elif STATE.status == STATUS_RELEASED:
+            layout.label(text="Released - claimed by another instance", icon='INFO')
+            layout.operator(MS_OT_ClaimLiveLink.bl_idname, text="Reclaim LiveLink", icon='FILE_REFRESH')
+        else:
+            layout.label(text="Stopped", icon='X')
+            layout.operator(MS_OT_StartLiveLink.bl_idname, icon='PLAY')
+        if STATE.last_asset:
+            layout.label(text="Last import: %s (%s)" % (STATE.last_asset, STATE.last_asset_time), icon='IMPORT')
+        if STATE.last_error:
+            box = layout.box()
+            box.alert = True
+            box.label(text="Last error:", icon='ERROR')
+            box.label(text=STATE.last_error[:120])
+        row = layout.row(align=True)
+        row.operator(MS_OT_CopyLog.bl_idname, icon='COPYDOWN')
+        row.operator(MS_OT_OpenLogFolder.bl_idname, icon='FILE_FOLDER')
+        if STATE.events:
+            box = layout.box()
+            box.label(text="Recent events:")
+            col = box.column(align=True)
+            for event in list(STATE.events)[-5:]:
+                col.label(text=event[:120])
+
 
 class MS_Init_Abc(bpy.types.Operator):
 
@@ -657,32 +933,44 @@ class MS_Init_Abc(bpy.types.Operator):
 
             return {'FINISHED'}
         except Exception as e:
-            print( "Megascans Plugin Error starting MS_Init_Abc. Error: ", str(e) )
+            log_event("ERROR", "Alembic import failed: %s" % e)
             return {"CANCELLED"}
 
-@persistent
-def load_plugin(scene):
-    try:
-        bpy.ops.bridge.plugin()
-    except Exception as e:
-        print( "Bridge Plugin Error::Could not start the plugin. Description: ", str(e) )
+def _ensure_pump():
+    if not bpy.app.timers.is_registered(_pump):
+        # persistent=True: the default (False) removes the timer on file load,
+        # which would silently kill the transport.
+        bpy.app.timers.register(_pump, first_interval=PUMP_INTERVAL, persistent=True)
 
 def menu_func_import(self, context):
     self.layout.operator(MS_Init_Abc.bl_idname, text="Megascans: Import Alembic Files")
 
+classes = (
+    MSPluginPreferences,
+    MS_Init_LiveLink,
+    MS_Init_Abc,
+    MS_OT_StartLiveLink,
+    MS_OT_ClaimLiveLink,
+    MS_OT_CopyLog,
+    MS_OT_OpenLogFolder,
+    MS_PT_LiveLink,
+)
+
 def register():
-    if len(bpy.app.handlers.load_post) > 0:
-        # Check if trying to register twice.
-        if "load_plugin" in bpy.app.handlers.load_post[0].__name__.lower() or load_plugin in bpy.app.handlers.load_post:
-            return
-    bpy.utils.register_class(MS_Init_LiveLink)
-    bpy.utils.register_class(MS_Init_Abc)
-    bpy.app.handlers.load_post.append(load_plugin)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    _ensure_pump()
+    start_listener()  # starts at enable time, not on load_post
 
 def unregister():
+    pending = len(STATE.queue) + len(STATE.connections)
+    if pending:
+        log_event("WARNING", "%d pending export(s) discarded on disable." % pending)
+    STATE.queue.clear()
+    if bpy.app.timers.is_registered(_pump):
+        bpy.app.timers.unregister(_pump)
+    stop_listener("LiveLink stopped (addon disabled).")
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
-    if len(bpy.app.handlers.load_post) > 0:
-        # Check if trying to register twice.
-        if "load_plugin" in bpy.app.handlers.load_post[0].__name__.lower() or load_plugin in bpy.app.handlers.load_post:
-            bpy.app.handlers.load_post.remove(load_plugin)
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
